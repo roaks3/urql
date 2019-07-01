@@ -18,8 +18,14 @@ import {
   subscriptionResult,
   undefinedQueryResponse,
 } from '../test-utils';
-import { Operation, OperationResult } from '../types';
+import {
+  Operation,
+  OperationContext,
+  OperationResult,
+  GraphQLRequest,
+} from '../types';
 import { afterMutation, cacheExchange } from './cache';
+import gql from 'graphql-tag';
 
 let response;
 let exchangeArgs;
@@ -202,4 +208,136 @@ describe('on empty query response', () => {
     expect(forwardedOperations.length).toBe(2);
     expect(reexecuteOperation).not.toBeCalled();
   });
+});
+
+it('retriggers query operation when mutation occurs with union type', () => {
+  const context: OperationContext = {
+    fetchOptions: {
+      method: 'POST',
+    },
+    requestPolicy: 'cache-first',
+    url: 'http://localhost:3000/graphql',
+  };
+
+  const queryAllGql: GraphQLRequest = {
+    key: 5,
+    query: gql`
+      query QueryLinks {
+        links {
+          type: __typename
+          ... on LinkRecord {
+            url
+          }
+          ... on DropdownLinkRecord {
+            links {
+              url
+            }
+          }
+        }
+      }
+    `,
+  };
+
+  const teardownAllOperation: Operation = {
+    query: queryAllGql.query,
+    variables: queryAllGql.variables,
+    key: queryAllGql.key,
+    operationName: 'teardown',
+    context,
+  };
+
+  const queryAllOperation: Operation = {
+    query: teardownAllOperation.query,
+    variables: teardownAllOperation.variables,
+    key: teardownAllOperation.key,
+    operationName: 'query',
+    context,
+  };
+
+  response = {
+    operation: queryAllOperation,
+    data: {
+      links: [
+        {
+          url: 'www.a.com',
+          __typename: 'LinkRecord',
+        },
+        {
+          url: 'www.b.com',
+          __typename: 'LinkRecord',
+        },
+        // If the below section is uncommented, the test passes as expected
+        // {
+        //   links: [
+        //     {
+        //       url: 'www.d.com'
+        //     },
+        //   ],
+        //   __typename: 'DropdownLinkRecord',
+        // }
+      ],
+    },
+  };
+
+  const [ops$, next, complete] = input;
+  const exchange = cacheExchange(exchangeArgs)(ops$);
+
+  publish(exchange);
+  next(queryAllOperation);
+
+  const mutationAddLinkGql: GraphQLRequest = {
+    key: 6,
+    query: gql`
+      mutation AddDropdownLink($link: DropdownLinkRecord!) {
+        createDropdownLink(link: $link) {
+          links {
+            url
+          }
+        }
+      }
+    `,
+    variables: {
+      link: {
+        links: [
+          {
+            url: 'www.c.com/1',
+          },
+          {
+            url: 'www.c.com/2',
+          },
+        ],
+      },
+    },
+  };
+
+  const mutationAddLinkOperation: Operation = {
+    query: mutationAddLinkGql.query,
+    variables: mutationAddLinkGql.variables,
+    key: mutationAddLinkGql.key,
+    operationName: 'mutation',
+    context,
+  };
+
+  response = {
+    operation: mutationAddLinkOperation,
+    data: {
+      createDropdownLink: {
+        links: [
+          {
+            url: 'www.c.com/1',
+          },
+          {
+            url: 'www.c.com/2',
+          },
+        ],
+        __typename: 'DropdownLinkRecord',
+      },
+    },
+  };
+
+  next(mutationAddLinkOperation);
+  complete();
+
+  // The original query should be re-executed to include the new DropdownLinkRecord result
+  expect(reexecuteOperation).toBeCalledTimes(1);
 });
